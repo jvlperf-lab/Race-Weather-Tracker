@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DA/RAW — Track Air Density Reader</title>
-<meta name="description" content="Averages weather data from NWS and multiple forecast models to compute density altitude and air density ratio for drag racing.">
+<meta name="description" content="Averages weather data from NWS and multiple forecast models to compute density altitude, correction factor and air density ratio for drag racing, with track-relative wind, 24h history and a short-range forecast.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -20,7 +20,7 @@
 
   <div class="locate-controls">
     <div class="search-wrap">
-      <input id="searchInput" type="text" placeholder="Search a track or city…" autocomplete="off">
+      <input id="searchInput" type="text" placeholder="Search a track, venue, or city…" autocomplete="off">
       <button id="searchBtn" class="btn-icon" aria-label="Search">GO</button>
       <div id="searchResults" class="search-results hidden"></div>
     </div>
@@ -48,7 +48,7 @@
 
   <section id="emptyState" class="empty-state">
     <p class="empty-headline">No track loaded</p>
-    <p class="empty-body">Search a track or city above, use your location, or pick a saved track to pull a live density-altitude reading averaged across NWS station data and five independent forecast models.</p>
+    <p class="empty-body">Search a track, venue, or city above, use your location, or pick a saved track. Readings are averaged across NWS station data and up to eight independent forecast models.</p>
   </section>
 
   <section id="readout" class="readout hidden">
@@ -66,19 +66,50 @@
       <div class="hero-sub">
         <span id="daNote">—</span>
       </div>
-      <div class="hero-secondary">
-        <div class="hero-stat">
-          <span class="hero-stat-label">Air Density Ratio</span>
-          <span id="densityRatio" class="hero-stat-value">—</span>
+
+      <div class="key-metrics" id="keyMetrics">
+        <div class="key-metric">
+          <span class="key-metric-label">Air Density Ratio</span>
+          <span id="densityRatio" class="key-metric-value">—</span>
         </div>
-        <div class="hero-stat">
-          <span class="hero-stat-label">Power Correction (≈ρ/ρ₀)</span>
-          <span id="correctionFactor" class="hero-stat-value">—</span>
+        <div class="key-metric">
+          <span class="key-metric-label">Correction Factor <em>SAE J1349</em></span>
+          <span id="correctionFactor" class="key-metric-value">—</span>
         </div>
-        <div class="hero-stat">
-          <span class="hero-stat-label">Pressure Altitude</span>
-          <span id="pressureAlt" class="hero-stat-value">—</span>
+        <div class="key-metric">
+          <span class="key-metric-label">Vapor Pressure</span>
+          <span id="vaporPressure" class="key-metric-value">—</span>
         </div>
+        <div class="key-metric">
+          <span class="key-metric-label">Baro (station)</span>
+          <span id="baroValue" class="key-metric-value">—</span>
+        </div>
+        <div class="key-metric">
+          <span class="key-metric-label">Humidity</span>
+          <span id="humidityValue" class="key-metric-value">—</span>
+        </div>
+        <div class="key-metric">
+          <span class="key-metric-label">Pressure Altitude</span>
+          <span id="pressureAlt" class="key-metric-value">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="wind-block">
+      <div class="wind-panel">
+        <div class="panel-title">Wind vs. Track</div>
+        <div id="windDiagram" class="wind-diagram"></div>
+      </div>
+      <div class="wind-readout">
+        <div class="heading-control">
+          <label for="headingInput">Starting-line heading (° true, direction of travel)</label>
+          <div class="heading-input-row">
+            <input type="number" id="headingInput" min="0" max="359" placeholder="e.g. 60">
+            <button id="headingSaveBtn" class="btn-outline small">Set</button>
+          </div>
+          <div class="heading-presets" id="headingPresets"></div>
+        </div>
+        <div class="avg-grid" id="windGrid"></div>
       </div>
     </div>
 
@@ -91,14 +122,45 @@
       <div class="sources-title">Source Breakdown</div>
       <div class="sources-grid" id="sourcesGrid"></div>
     </div>
+
+    <div class="history-block">
+      <div class="panel-title-row">
+        <div class="panel-title">Last 24 Hours</div>
+        <select id="historyMetric" class="metric-select">
+          <option value="da">Density Altitude</option>
+          <option value="ratio">Air Density Ratio</option>
+          <option value="tempF">Temp</option>
+          <option value="baro">Baro</option>
+          <option value="rh">Humidity</option>
+          <option value="vapor">Vapor Pressure</option>
+        </select>
+      </div>
+      <p class="panel-note">Dashed = hourly backfill from the model archive. Solid = recorded live, every 5 minutes, while this page stays open in your browser.</p>
+      <div class="chart-wrap"><canvas id="historyChart" height="90"></canvas></div>
+    </div>
+
+    <div class="forecast-block">
+      <div class="panel-title">Next Two Hours <span class="panel-title-sub">Open-Meteo best-match, 15-min steps</span></div>
+      <div class="table-wrap">
+        <table id="forecastTable" class="forecast-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Temp</th><th>Baro</th><th>Humidity</th><th>Vapor</th><th>DA</th><th>Ratio</th><th>Wind</th>
+            </tr>
+          </thead>
+          <tbody id="forecastBody"></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
 </main>
 
 <footer class="site-footer">
-  <p>Data: National Weather Service (station observations, US only) and Open-Meteo (best-match, NOAA GFS, DWD ICON, ECMWF IFS, ECCC GEM). Density altitude uses the standard pressure-altitude + ISA lapse-rate approximation; air density ratio is computed from actual station pressure, temperature and humidity via the ideal gas law. Cross-check against your own NHRA/SAE correction-factor calculator before making tuning calls — this is a field reference, not a certified instrument.</p>
+  <p>Data: National Weather Service (station observations, US only) and Open-Meteo (best-match, NOAA GFS, DWD ICON, ECMWF IFS, ECCC GEM, UK Met Office, Météo-France, JMA). Track/venue search uses OpenStreetMap Nominatim (© OpenStreetMap contributors) alongside Open-Meteo's geocoder. Density altitude uses the standard pressure-altitude + ISA lapse-rate approximation; air density ratio comes from actual station pressure, temperature and humidity via the ideal gas law; the correction factor uses SAE J1349 (99 kPa / 298 K reference). These are field-reference numbers — cross-check against your own NHRA/SAE calculator before making a tuning call.</p>
 </footer>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
