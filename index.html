@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DA/RAW — Track Air Density Reader</title>
+<meta name="description" content="Averages weather data from NWS and multiple forecast models to compute density altitude and air density ratio for drag racing.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wordmark">
+    <span class="wordmark-main">DA<span class="slash">/</span>RAW</span>
+    <span class="wordmark-sub">air density readout</span>
+  </div>
+
+  <div class="locate-controls">
+    <div class="search-wrap">
+      <input id="searchInput" type="text" placeholder="Search a track or city…" autocomplete="off">
+      <button id="searchBtn" class="btn-icon" aria-label="Search">GO</button>
+      <div id="searchResults" class="search-results hidden"></div>
+    </div>
+    <button id="geoBtn" class="btn-outline">Use my location</button>
+  </div>
+</header>
+
+<nav class="saved-strip" id="savedStrip" aria-label="Saved tracks">
+  <span class="saved-label">Saved:</span>
+  <div id="savedPills" class="saved-pills"></div>
+</nav>
+
+<main>
+
+  <section class="status-bar">
+    <div class="bulbs" id="bulbs" aria-label="Source status"></div>
+    <div class="status-text">
+      <span id="statusCount">No location loaded</span>
+      <span class="status-dot">·</span>
+      <span id="statusTime">—</span>
+    </div>
+    <button id="refreshBtn" class="btn-outline small" disabled>Refresh</button>
+    <button id="saveBtn" class="btn-outline small" disabled>Save track</button>
+  </section>
+
+  <section id="emptyState" class="empty-state">
+    <p class="empty-headline">No track loaded</p>
+    <p class="empty-body">Search a track or city above, use your location, or pick a saved track to pull a live density-altitude reading averaged across NWS station data and five independent forecast models.</p>
+  </section>
+
+  <section id="readout" class="readout hidden">
+    <div class="location-line">
+      <h1 id="locationName">—</h1>
+      <span id="locationMeta" class="location-meta">—</span>
+    </div>
+
+    <div class="hero">
+      <div class="hero-label">Density Altitude</div>
+      <div class="scoreboard">
+        <span id="daValue">—</span>
+        <span class="scoreboard-unit">FT</span>
+      </div>
+      <div class="hero-sub">
+        <span id="daNote">—</span>
+      </div>
+      <div class="hero-secondary">
+        <div class="hero-stat">
+          <span class="hero-stat-label">Air Density Ratio</span>
+          <span id="densityRatio" class="hero-stat-value">—</span>
+        </div>
+        <div class="hero-stat">
+          <span class="hero-stat-label">Power Correction (≈ρ/ρ₀)</span>
+          <span id="correctionFactor" class="hero-stat-value">—</span>
+        </div>
+        <div class="hero-stat">
+          <span class="hero-stat-label">Pressure Altitude</span>
+          <span id="pressureAlt" class="hero-stat-value">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="averaged-row" id="averagedRow">
+      <div class="avg-title">Averaged Conditions <span id="avgSourceCount" class="avg-title-sub"></span></div>
+      <div class="avg-grid" id="avgGrid"></div>
+    </div>
+
+    <div class="sources-block">
+      <div class="sources-title">Source Breakdown</div>
+      <div class="sources-grid" id="sourcesGrid"></div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <p>Data: National Weather Service (station observations, US only) and Open-Meteo (best-match, NOAA GFS, DWD ICON, ECMWF IFS, ECCC GEM). Density altitude uses the standard pressure-altitude + ISA lapse-rate approximation; air density ratio is computed from actual station pressure, temperature and humidity via the ideal gas law. Cross-check against your own NHRA/SAE correction-factor calculator before making tuning calls — this is a field reference, not a certified instrument.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
