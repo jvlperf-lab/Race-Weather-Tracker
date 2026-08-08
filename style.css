@@ -412,16 +412,28 @@ main { max-width: 1080px; margin: 0 auto; padding: 28px; }
 .sources-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
 .source-card { background: var(--panel); border: 1px solid var(--hairline); border-radius: 6px; padding: 14px 16px; }
 .source-card.fail { opacity: 0.55; }
-.source-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.source-card.excluded { opacity: 0.5; border-style: dashed; }
+.source-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; }
+.source-card-header-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .source-card-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
 .source-card-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .source-card-dot.ok { background: var(--green); }
 .source-card-dot.fail { background: var(--red); }
+.source-card-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.source-card-toggle input { width: 13px; height: 13px; cursor: pointer; }
 .source-card-rows { display: flex; flex-direction: column; gap: 5px; }
 .source-card-row { display: flex; justify-content: space-between; font-size: 12px; }
 .source-card-row-label { color: var(--text-faint); }
 .source-card-row-value { font-family: var(--font-mono); color: var(--text-dim); }
 .source-card-error { font-size: 11.5px; color: var(--text-faint); font-style: italic; }
+.source-card-flag { margin-top: 10px; font-size: 11px; color: var(--amber); line-height: 1.5; }
 
 /* ---------- history / forecast / radar / alerts ---------- */
 
