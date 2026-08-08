@@ -1,0 +1,10 @@
+{
+  "trackName": "Mooresville Dragway",
+  "lat": 35.5849,
+  "lon": -80.8101,
+  "highFt": 4000,
+  "lowFt": 500,
+  "cooldownMinutes": 30,
+  "updateMinutes": 0,
+  "excludedSources": []
+}
