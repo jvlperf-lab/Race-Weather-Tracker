@@ -49,8 +49,10 @@ const CURRENT_VARS = 'temperature_2m,relative_humidity_2m,dew_point_2m,surface_p
 const HISTORY_PREFIX = 'da_raw_history_';
 const HEADING_PREFIX = 'da_raw_heading_';
 const SAVED_KEY = 'da_raw_saved_tracks';
+const EXCLUDED_SOURCES_KEY = 'da_raw_excluded_sources';
 const ALERT_CONFIG_KEY = 'da_raw_alert_config';
 const ALERT_LAST_SENT_PREFIX = 'da_raw_alert_last_';
+const ALERT_UPDATE_PREFIX = 'da_raw_update_last_';
 const RECORD_INTERVAL_MS = 5 * 60 * 1000;
 const RECORD_MIN_GAP_MS = 4 * 60 * 1000;
 const ALERT_COOLDOWN_MS = 30 * 60 * 1000;
@@ -117,6 +119,7 @@ const alertTemplateId = $('alertTemplateId');
 const alertTo = $('alertTo');
 const alertHigh = $('alertHigh');
 const alertLow = $('alertLow');
+const alertUpdateMinutes = $('alertUpdateMinutes');
 const alertEnabled = $('alertEnabled');
 const alertSaveBtn = $('alertSaveBtn');
 const alertTestBtn = $('alertTestBtn');
@@ -125,8 +128,15 @@ const alertStatus = $('alertStatus');
 let currentLocation = null; // { name, admin, country, lat, lon, elevationM, heading, headingIsGuess }
 let lastAveraged = null;
 let lastBackfill = [];
+let lastBackfillSource = null; // 'station' | 'model' | null
+let lastResults = [];
 let autoRefreshTimer = null;
 let historyChartInstance = null;
+
+function getExcludedSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(EXCLUDED_SOURCES_KEY)) || []); } catch { return new Set(); }
+}
+function setExcludedSet(set) { localStorage.setItem(EXCLUDED_SOURCES_KEY, JSON.stringify([...set])); }
 
 // ------------------------------------------------------------
 // Unit helpers
@@ -185,14 +195,32 @@ function airDensityRatio(stationHpa, tempC, rh) {
   return rho / rho0;
 }
 
-// SAE J1349 correction factor: CF = (99 / Pd_kPa) * sqrt(T_K / 298)
-function correctionFactorSAE(stationHpa, tempC, rh) {
-  if ([stationHpa, tempC, rh].some((v) => v === null || v === undefined)) return null;
-  const e = vaporPressureHpa(tempC, rh);
-  const pdKpa = (stationHpa - e) / 10;
-  const tK = tempC + 273.15;
-  if (pdKpa <= 0) return null;
-  return (99 / pdKpa) * Math.sqrt(tK / 298);
+// Correction factor as used by most trackside racing calculators: the
+// reciprocal of air density ratio (ρ₀/ρ) — how much you'd scale a
+// naturally-aspirated baseline reading to correct for today's air.
+// (This is distinct from the SAE J1349 dyno-correction standard.)
+function correctionFactor(ratio) {
+  if (ratio === null || ratio === undefined || ratio === 0) return null;
+  return 1 / ratio;
+}
+
+// Reject a source's pressure from the average if it's a clear outlier vs.
+// the others — catches a source reporting sea-level/corrected pressure
+// instead of actual station pressure, which otherwise skews DA badly.
+function rejectPressureOutliers(entries) {
+  const valid = entries.filter((e) => e.value !== null && e.value !== undefined);
+  if (valid.length < 3) return { keep: valid, excludedIds: new Set() };
+  const sorted = [...valid].sort((a, b) => a.value - b.value);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? sorted[mid].value : (sorted[mid - 1].value + sorted[mid].value) / 2;
+  const THRESHOLD_HPA = 5; // ~0.15 inHg
+  const keep = [];
+  const excludedIds = new Set();
+  valid.forEach((e) => {
+    if (Math.abs(e.value - median) > THRESHOLD_HPA) excludedIds.add(e.id);
+    else keep.push(e);
+  });
+  return { keep, excludedIds };
 }
 
 function circularMeanDeg(degs) {
@@ -271,7 +299,8 @@ async function fetchNWS(lat, lon) {
     const p = obs.properties;
     return {
       id: 'nws',
-      label: `NWS · ${stationId}`,
+      label: 'NWS station obs',
+      stationId,
       ok: true,
       tempC: p.temperature?.value ?? null,
       rh: p.relativeHumidity?.value ?? null,
@@ -337,6 +366,36 @@ async function fetchBackfillHourly(lat, lon) {
       });
     }
     return points;
+  } catch (e) {
+    return [];
+  }
+}
+
+// Real historical station observations (US only) — actual instrument
+// readings archived by NWS, not a model reconstruction.
+async function fetchStationHistory24h(stationId) {
+  try {
+    const end = new Date();
+    const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+    const url = `https://api.weather.gov/stations/${stationId}/observations?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('station history unavailable');
+    const data = await res.json();
+    return (data.features || [])
+      .map((f) => {
+        const p = f.properties;
+        const tempC = p.temperature?.value ?? null;
+        const rh = p.relativeHumidity?.value ?? null;
+        const pressureHpa = p.barometricPressure?.value != null ? p.barometricPressure.value / 100 : null;
+        return {
+          t: p.timestamp, tempC, rh, pressureHpa,
+          da: densityAltitudeFt(pressureHpa, tempC),
+          ratio: airDensityRatio(pressureHpa, tempC, rh),
+          vaporHpa: vaporPressureHpa(tempC, rh),
+        };
+      })
+      .filter((pt) => pt.t)
+      .sort((a, b) => new Date(a.t) - new Date(b.t));
   } catch (e) {
     return [];
   }
@@ -483,48 +542,71 @@ async function loadLocation(loc) {
 
   radarFrame.src = `https://embed.windy.com/embed2.html?lat=${loc.lat}&lon=${loc.lon}&detailLat=${loc.lat}&detailLon=${loc.lon}&zoom=8&level=surface&overlay=radar&product=radar&menu=&message=&marker=true&calendar=now&pressure=&type=map&location=coordinates&detail=&metricWind=mph&metricTemp=%C2%B0F&radarRange=-1`;
 
-  const jobs = [fetchNWS(loc.lat, loc.lon), ...OPEN_METEO_MODELS.map((m) => fetchOpenMeteoModel(loc.lat, loc.lon, m))];
-  buildBulbs(jobs.length);
+  const totalSources = 1 + OPEN_METEO_MODELS.length;
+  buildBulbs(totalSources);
   statusCount.textContent = 'Loading sources…';
   statusTime.textContent = '—';
   forecastBody.innerHTML = `<tr><td colspan="8" class="source-card-error">Loading…</td></tr>`;
 
-  const results = new Array(jobs.length);
-  const currentPromise = Promise.all(
-    jobs.map((p, i) => p.then((res) => { results[i] = res; setBulb(i, res.ok ? 'ok' : 'fail'); }))
+  const results = new Array(totalSources);
+
+  // NWS goes first, sequentially, so a successful lookup can also drive
+  // real station-history backfill (see below) instead of a model guess.
+  const nwsResult = await fetchNWS(loc.lat, loc.lon);
+  results[0] = nwsResult;
+  setBulb(0, nwsResult.ok ? 'ok' : 'fail');
+
+  const modelsSettled = Promise.all(
+    OPEN_METEO_MODELS.map((m, i) =>
+      fetchOpenMeteoModel(loc.lat, loc.lon, m).then((res) => { results[i + 1] = res; setBulb(i + 1, res.ok ? 'ok' : 'fail'); })
+    )
   );
 
-  const [, backfill, forecast] = await Promise.all([
-    currentPromise,
-    fetchBackfillHourly(loc.lat, loc.lon),
-    fetchForecast15(loc.lat, loc.lon),
-  ]);
+  const backfillSettled = (async () => {
+    if (nwsResult.ok && nwsResult.stationId) {
+      const points = await fetchStationHistory24h(nwsResult.stationId);
+      if (points.length) return { source: 'station', points };
+    }
+    const points = await fetchBackfillHourly(loc.lat, loc.lon);
+    return { source: 'model', points };
+  })();
 
-  lastBackfill = backfill;
+  const [, backfillResult, forecast] = await Promise.all([modelsSettled, backfillSettled, fetchForecast15(loc.lat, loc.lon)]);
+
+  lastBackfill = backfillResult.points;
+  lastBackfillSource = backfillResult.source;
   renderResults(results);
   renderForecastTable(forecast);
   renderHistoryChart();
-  checkAlerts();
+  checkAlertsAndUpdates();
 
   autoRefreshTimer = setInterval(() => loadLocation(currentLocation), RECORD_INTERVAL_MS);
 }
 
 function renderResults(results) {
-  const okResults = results.filter((r) => r.ok);
-  statusCount.textContent = `${okResults.length} of ${results.length} sources reporting`;
+  lastResults = results;
+  const manuallyExcluded = getExcludedSet();
+  const okResults = results.filter((r) => r.ok && !manuallyExcluded.has(r.id));
+  statusCount.textContent = `${okResults.length} of ${results.length} sources in average`;
   statusTime.textContent = `updated ${new Date().toLocaleTimeString()}`;
 
   const avgTempC = average(okResults.map((r) => r.tempC));
   const avgRh = average(okResults.map((r) => r.rh));
   const avgDewC = average(okResults.map((r) => r.dewC));
-  const avgPressureHpa = average(okResults.map((r) => r.pressureHpa));
   const avgWindKmh = average(okResults.map((r) => r.windKmh));
   const avgWindDeg = circularMeanDeg(okResults.map((r) => r.windDeg));
+
+  // Pressure gets extra scrutiny: a source reporting sea-level/corrected
+  // pressure instead of station pressure will badly skew DA, so outliers
+  // vs. the group median are automatically dropped from this average only.
+  const pressureEntries = okResults.map((r) => ({ id: r.id, value: r.pressureHpa }));
+  const { keep: pressureKeep, excludedIds: pressureOutlierIds } = rejectPressureOutliers(pressureEntries);
+  const avgPressureHpa = average(pressureKeep.map((e) => e.value));
 
   const da = densityAltitudeFt(avgPressureHpa, avgTempC);
   const pa = pressureAltitudeFt(avgPressureHpa);
   const ratio = airDensityRatio(avgPressureHpa, avgTempC, avgRh);
-  const cf = correctionFactorSAE(avgPressureHpa, avgTempC, avgRh);
+  const cf = correctionFactor(ratio);
   const vaporHpa = vaporPressureHpa(avgTempC, avgRh);
 
   lastAveraged = {
@@ -560,35 +642,56 @@ function renderResults(results) {
   });
 
   sourcesGrid.innerHTML = '';
-  results.forEach((r) => {
+  results.forEach((r, i) => {
+    const displayName = `Station ${i + 1}`;
+    const isExcluded = manuallyExcluded.has(r.id);
+    const isPressureOutlier = pressureOutlierIds.has(r.id);
     const card = document.createElement('div');
-    card.className = `source-card ${r.ok ? '' : 'fail'}`;
+    card.className = `source-card ${r.ok ? '' : 'fail'} ${isExcluded ? 'excluded' : ''}`;
+
     if (!r.ok) {
       card.innerHTML = `
         <div class="source-card-header">
-          <span class="source-card-name">${r.label}</span>
+          <span class="source-card-name">${displayName}</span>
           <span class="source-card-dot fail"></span>
         </div>
         <div class="source-card-error">${r.error || 'unavailable'}</div>`;
       sourcesGrid.appendChild(card);
       return;
     }
+    const pressureValue = r.pressureHpa !== null
+      ? `${fmt(hpa2inHg(r.pressureHpa), 2)} inHg${isPressureOutlier ? ' ⚠' : ''}`
+      : '—';
     const rows = [
       ['Temp', `${fmt(c2f(r.tempC))}°F`],
       ['Dewpoint', r.dewC !== null ? `${fmt(c2f(r.dewC))}°F` : '—'],
       ['Humidity', r.rh !== null ? `${fmt(r.rh, 0)}%` : '—'],
-      ['Pressure', r.pressureHpa !== null ? `${fmt(hpa2inHg(r.pressureHpa), 2)} inHg` : '—'],
+      ['Pressure', pressureValue],
       ['Wind', r.windKmh !== null ? `${fmt(kmh2mph(r.windKmh), 0)} mph${r.windDeg !== null ? ' @ ' + Math.round(r.windDeg) + '°' : ''}` : '—'],
     ];
     card.innerHTML = `
       <div class="source-card-header">
-        <span class="source-card-name">${r.label}</span>
-        <span class="source-card-dot ok"></span>
+        <span class="source-card-name">${displayName}</span>
+        <div class="source-card-header-right">
+          <span class="source-card-dot ok"></span>
+          <label class="source-card-toggle"><input type="checkbox" data-id="${r.id}" ${isExcluded ? '' : 'checked'}> use</label>
+        </div>
       </div>
       <div class="source-card-rows">
         ${rows.map(([l, v]) => `<div class="source-card-row"><span class="source-card-row-label">${l}</span><span class="source-card-row-value">${v}</span></div>`).join('')}
-      </div>`;
+      </div>
+      ${isPressureOutlier ? '<div class="source-card-flag">Pressure excluded from average — reads as corrected/sea-level, not station pressure</div>' : ''}
+      ${isExcluded ? '<div class="source-card-flag">Excluded from average</div>' : ''}`;
     sourcesGrid.appendChild(card);
+  });
+
+  sourcesGrid.querySelectorAll('input[type="checkbox"][data-id]').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const set = getExcludedSet();
+      if (cb.checked) set.delete(cb.dataset.id); else set.add(cb.dataset.id);
+      setExcludedSet(set);
+      renderResults(lastResults); // recompute from cached results, no refetch
+    });
   });
 
   renderWindPanel();
@@ -705,6 +808,14 @@ headingFlipBtn.addEventListener('click', () => {
 
 function renderHistoryChart() {
   if (!currentLocation || typeof Chart === 'undefined') return;
+
+  const noteEl = $('historyNote');
+  if (noteEl) {
+    noteEl.textContent = lastBackfillSource === 'station'
+      ? 'Dashed = real NWS station observations for the trailing 24h (actual instrument readings, not a model estimate). Solid = recorded live, every 5 minutes, while this page stays open.'
+      : 'Dashed = the forecast model archive\'s best reconstruction of the trailing 24h (not a US station, so no raw instrument log is available — see README). Solid = recorded live, every 5 minutes, while this page stays open.';
+  }
+
   const metricKey = historyMetricEl.value;
   const cfg = METRIC_CONFIG[metricKey];
   const recorded = getRecordedHistory(currentLocation);
@@ -735,7 +846,7 @@ function renderHistoryChart() {
     data: {
       labels,
       datasets: [
-        { label: 'Backfill (hourly)', data: backfillData, borderColor: '#565B64', borderDash: [4, 3], pointRadius: 0, spanGaps: true, tension: 0.25 },
+        { label: lastBackfillSource === 'station' ? 'Backfill (real station obs)' : 'Backfill (model estimate)', data: backfillData, borderColor: '#565B64', borderDash: [4, 3], pointRadius: 0, spanGaps: true, tension: 0.25 },
         { label: 'Recorded (live, 5 min)', data: recordedData, borderColor: '#FFB300', backgroundColor: 'rgba(255,179,0,0.08)', pointRadius: 2, spanGaps: true, tension: 0.25, fill: true },
       ],
     },
@@ -999,6 +1110,7 @@ function loadAlertUI() {
   alertTo.value = cfg.to || '';
   alertHigh.value = cfg.high ?? '';
   alertLow.value = cfg.low ?? '';
+  alertUpdateMinutes.value = cfg.updateMinutes ?? '';
   alertEnabled.checked = !!cfg.enabled;
 }
 loadAlertUI();
@@ -1013,6 +1125,7 @@ alertSaveBtn.addEventListener('click', () => {
     to: alertTo.value.trim(),
     high: alertHigh.value !== '' ? Number(alertHigh.value) : null,
     low: alertLow.value !== '' ? Number(alertLow.value) : null,
+    updateMinutes: alertUpdateMinutes.value !== '' ? Number(alertUpdateMinutes.value) : null,
     enabled: alertEnabled.checked,
   };
   setAlertConfig(cfg);
@@ -1047,28 +1160,53 @@ alertTestBtn.addEventListener('click', async () => {
   }
 });
 
-async function checkAlerts() {
+function conditionsSummary() {
+  const a = lastAveraged;
+  if (!a) return '';
+  const parts = [];
+  if (a.da !== null) parts.push(`DA ${Math.round(a.da).toLocaleString()} ft`);
+  if (a.ratio !== null) parts.push(`density ${fmt(a.ratio * 100, 1)}%`);
+  if (a.cf !== null) parts.push(`CF ${fmt(a.cf, 3)}`);
+  if (a.pressureHpa !== null) parts.push(`baro ${fmt(hpa2inHg(a.pressureHpa), 2)}"`);
+  if (a.tempC !== null) parts.push(`${fmt(c2f(a.tempC), 0)}°F`);
+  if (a.rh !== null) parts.push(`${fmt(a.rh, 0)}% RH`);
+  return parts.join(', ');
+}
+
+async function checkAlertsAndUpdates() {
   const cfg = getAlertConfig();
-  if (!cfg.enabled || !cfg.publicKey || !cfg.serviceId || !cfg.templateId || !cfg.to || !currentLocation || !lastAveraged) return;
-  if (lastAveraged.da === null) return;
+  if (!cfg.publicKey || !cfg.serviceId || !cfg.templateId || !cfg.to || !currentLocation || !lastAveraged) return;
 
-  let triggered = null;
-  if (cfg.high !== null && cfg.high !== undefined && lastAveraged.da > cfg.high) {
-    triggered = `Density altitude at ${currentLocation.name} is ${Math.round(lastAveraged.da).toLocaleString()} ft — above your ${cfg.high.toLocaleString()} ft threshold.`;
-  } else if (cfg.low !== null && cfg.low !== undefined && lastAveraged.da < cfg.low) {
-    triggered = `Density altitude at ${currentLocation.name} is ${Math.round(lastAveraged.da).toLocaleString()} ft — below your ${cfg.low.toLocaleString()} ft threshold.`;
+  // Threshold alert (only if enabled + a threshold is actually crossed).
+  if (cfg.enabled && lastAveraged.da !== null) {
+    let triggered = null;
+    if (cfg.high !== null && cfg.high !== undefined && lastAveraged.da > cfg.high) {
+      triggered = `Density altitude at ${currentLocation.name} is ${Math.round(lastAveraged.da).toLocaleString()} ft — above your ${cfg.high.toLocaleString()} ft threshold.`;
+    } else if (cfg.low !== null && cfg.low !== undefined && lastAveraged.da < cfg.low) {
+      triggered = `Density altitude at ${currentLocation.name} is ${Math.round(lastAveraged.da).toLocaleString()} ft — below your ${cfg.low.toLocaleString()} ft threshold.`;
+    }
+    if (triggered) {
+      const cooldownKey = ALERT_LAST_SENT_PREFIX + locKey(currentLocation);
+      const last = Number(localStorage.getItem(cooldownKey) || 0);
+      if (Date.now() - last >= ALERT_COOLDOWN_MS) {
+        try {
+          await sendAlertEmail(cfg, 'DA/RAW alert', triggered);
+          localStorage.setItem(cooldownKey, String(Date.now()));
+        } catch (e) { /* surfaced via the Send test button, not the background loop */ }
+      }
+    }
   }
-  if (!triggered) return;
 
-  const cooldownKey = ALERT_LAST_SENT_PREFIX + locKey(currentLocation);
-  const last = Number(localStorage.getItem(cooldownKey) || 0);
-  if (Date.now() - last < ALERT_COOLDOWN_MS) return;
-
-  try {
-    await sendAlertEmail(cfg, 'DA/RAW alert', triggered);
-    localStorage.setItem(cooldownKey, String(Date.now()));
-  } catch (e) {
-    // Fail silently in the background loop; the test button surfaces setup errors.
+  // Routine weather-update text, independent of any threshold.
+  if (cfg.updateMinutes) {
+    const updateKey = ALERT_UPDATE_PREFIX + locKey(currentLocation);
+    const lastUpdate = Number(localStorage.getItem(updateKey) || 0);
+    if (Date.now() - lastUpdate >= cfg.updateMinutes * 60 * 1000) {
+      try {
+        await sendAlertEmail(cfg, 'DA/RAW weather update', `${currentLocation.name}: ${conditionsSummary()}.`);
+        localStorage.setItem(updateKey, String(Date.now()));
+      } catch (e) { /* surfaced via the Send test button, not the background loop */ }
+    }
   }
 }
 
