@@ -2,9 +2,10 @@
 // DA/RAW — averages weather data across NWS + several forecast
 // models, derives density altitude / air density ratio / SAE
 // correction factor / vapor pressure, tracks wind relative to
-// a starting-line heading, records a rolling 24h history, and
-// pulls a 15-minute-step short-range forecast.
-// No API keys required. All sources are free/public.
+// a starting-line heading (with best-effort auto-detection),
+// records a rolling 24h history, pulls a 15-min short-range
+// forecast, embeds a radar loop, and can fire email/text alerts
+// via EmailJS. No API keys required for weather data itself.
 // ============================================================
 
 const OPEN_METEO_MODELS = [
@@ -18,12 +19,41 @@ const OPEN_METEO_MODELS = [
   { id: 'jma_seamless', label: 'JMA (Japan)' },
 ];
 
+// Best-effort worldwide quick picks. Each is resolved live via search
+// (Nominatim first, Open-Meteo geocoder fallback) when clicked, rather
+// than hardcoded coordinates, so a bad guess never ships silently.
+const QUICK_TRACKS_US = [
+  'Auto Club Raceway at Pomona',
+  'zMAX Dragway Concord NC',
+  'Lucas Oil Raceway Indianapolis',
+  'Texas Motorplex Ennis TX',
+  'Bandimere Speedway Morrison CO',
+  'The Strip at Las Vegas Motor Speedway',
+  'Summit Motorsports Park Norwalk OH',
+  'Maple Grove Raceway Mohnton PA',
+  'Brainerd International Raceway',
+  'Wild Horse Pass Motorsports Park Chandler AZ',
+];
+const QUICK_TRACKS_INTL = [
+  'Santa Pod Raceway UK',
+  'Tierp Arena Sweden',
+  'Alastaro Circuit Finland',
+  'Mantorp Park Sweden',
+  'Sydney Dragway Australia',
+  'Willowbank Raceway Australia',
+  'Perth Motorplex Australia',
+  'Meremere Dragway New Zealand',
+];
+
 const CURRENT_VARS = 'temperature_2m,relative_humidity_2m,dew_point_2m,surface_pressure,wind_speed_10m,wind_direction_10m';
 const HISTORY_PREFIX = 'da_raw_history_';
 const HEADING_PREFIX = 'da_raw_heading_';
 const SAVED_KEY = 'da_raw_saved_tracks';
+const ALERT_CONFIG_KEY = 'da_raw_alert_config';
+const ALERT_LAST_SENT_PREFIX = 'da_raw_alert_last_';
 const RECORD_INTERVAL_MS = 5 * 60 * 1000;
 const RECORD_MIN_GAP_MS = 4 * 60 * 1000;
+const ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
 const METRIC_CONFIG = {
   da: { label: 'Density Altitude (ft)', get: (p) => p.da },
@@ -44,6 +74,10 @@ const searchInput = $('searchInput');
 const searchBtn = $('searchBtn');
 const searchResults = $('searchResults');
 const geoBtn = $('geoBtn');
+const quickPicksToggle = $('quickPicksToggle');
+const quickPicksPanel = $('quickPicksPanel');
+const quickPicksUSEl = $('quickPicksUS');
+const quickPicksIntlEl = $('quickPicksIntl');
 const savedPillsEl = $('savedPills');
 const bulbsEl = $('bulbs');
 const statusCount = $('statusCount');
@@ -69,11 +103,26 @@ const windDiagramEl = $('windDiagram');
 const windGridEl = $('windGrid');
 const headingInput = $('headingInput');
 const headingSaveBtn = $('headingSaveBtn');
+const headingFlipBtn = $('headingFlipBtn');
+const headingNoteEl = $('headingNote');
 const headingPresetsEl = $('headingPresets');
 const historyMetricEl = $('historyMetric');
 const forecastBody = $('forecastBody');
+const radarFrame = $('radarFrame');
+const alertsToggle = $('alertsToggle');
+const alertsPanel = $('alertsPanel');
+const alertPublicKey = $('alertPublicKey');
+const alertServiceId = $('alertServiceId');
+const alertTemplateId = $('alertTemplateId');
+const alertTo = $('alertTo');
+const alertHigh = $('alertHigh');
+const alertLow = $('alertLow');
+const alertEnabled = $('alertEnabled');
+const alertSaveBtn = $('alertSaveBtn');
+const alertTestBtn = $('alertTestBtn');
+const alertStatus = $('alertStatus');
 
-let currentLocation = null; // { name, admin, country, lat, lon, elevationM, heading }
+let currentLocation = null; // { name, admin, country, lat, lon, elevationM, heading, headingIsGuess }
 let lastAveraged = null;
 let lastBackfill = [];
 let autoRefreshTimer = null;
@@ -82,10 +131,10 @@ let historyChartInstance = null;
 // ------------------------------------------------------------
 // Unit helpers
 // ------------------------------------------------------------
-const c2f = (c) => (c * 9) / 5 + 32;
-const hpa2inHg = (h) => h * 0.0295299831;
-const kmh2mph = (k) => k * 0.621371;
-const m2ft = (m) => m * 3.28084;
+function c2f(c) { return (c * 9) / 5 + 32; }
+function hpa2inHg(h) { return h * 0.0295299831; }
+function kmh2mph(k) { return k * 0.621371; }
+function m2ft(m) { return m * 3.28084; }
 
 function fmt(n, digits = 1) {
   if (n === null || n === undefined || Number.isNaN(n)) return '—';
@@ -106,13 +155,11 @@ function compassLabel(deg) {
 // Density altitude / air density / correction factor math
 // ------------------------------------------------------------
 
-// Pressure altitude from actual station pressure (hPa), standard atmosphere.
 function pressureAltitudeFt(stationHpa) {
   if (stationHpa === null || stationHpa === undefined) return null;
   return 145366.45 * (1 - Math.pow(stationHpa / 1013.25, 0.190284));
 }
 
-// FAA-style density altitude approximation: PA + 120 * (OAT - ISA temp at PA)
 function densityAltitudeFt(stationHpa, tempC) {
   const pa = pressureAltitudeFt(stationHpa);
   if (pa === null || tempC === null || tempC === undefined) return null;
@@ -120,14 +167,12 @@ function densityAltitudeFt(stationHpa, tempC) {
   return pa + 120 * (tempC - isaTempC);
 }
 
-// Saturation vapor pressure (Buck equation, hPa) and actual vapor pressure from RH.
 function vaporPressureHpa(tempC, rh) {
   if (tempC === null || tempC === undefined || rh === null || rh === undefined) return null;
   const es = 6.1121 * Math.exp((18.678 - tempC / 234.5) * (tempC / (257.14 + tempC)));
   return es * (rh / 100);
 }
 
-// Actual (moist) air density ratio vs. standard sea-level density, via ideal gas law.
 function airDensityRatio(stationHpa, tempC, rh) {
   if ([stationHpa, tempC, rh].some((v) => v === null || v === undefined)) return null;
   const tK = tempC + 273.15;
@@ -170,19 +215,39 @@ function average(vals) {
   return v.reduce((a, b) => a + b, 0) / v.length;
 }
 
-// Headwind/tailwind/crosswind relative to a starting-line heading (direction of travel).
-// windFromDeg is meteorological "coming from" convention, as reported by every source here.
 function windRelative(trackHeadingDeg, windFromDeg, windSpeedMph) {
   if ([trackHeadingDeg, windFromDeg, windSpeedMph].some((v) => v === null || v === undefined)) return null;
   const blowingToward = (windFromDeg + 180) % 360;
   let rel = blowingToward - trackHeadingDeg;
-  rel = ((rel + 180) % 360 + 360) % 360 - 180; // normalize to [-180, 180]
+  rel = ((rel + 180) % 360 + 360) % 360 - 180;
   const rad = (rel * Math.PI) / 180;
   return {
     rel,
-    headTail: windSpeedMph * Math.cos(rad), // positive = tailwind, negative = headwind
-    cross: windSpeedMph * Math.sin(rad), // positive = pushing right of travel direction
+    headTail: windSpeedMph * Math.cos(rad),
+    cross: windSpeedMph * Math.sin(rad),
   };
+}
+
+// Initial great-circle bearing from point 1 to point 2, in degrees true.
+function bearingBetween(lat1, lon1, lat2, lon2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const toDeg = (r) => (r * 180) / Math.PI;
+  const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+// Best-effort heading from an OSM line geometry (only works if the track
+// is mapped as a line/way, and can't know which end is the starting line).
+function suggestHeadingFromGeojson(geojson) {
+  if (!geojson) return null;
+  let coords = null;
+  if (geojson.type === 'LineString') coords = geojson.coordinates;
+  else if (geojson.type === 'MultiLineString' && geojson.coordinates.length) coords = geojson.coordinates[0];
+  if (!coords || coords.length < 2) return null;
+  const [lon1, lat1] = coords[0];
+  const [lon2, lat2] = coords[coords.length - 1];
+  return bearingBetween(lat1, lon1, lat2, lon2);
 }
 
 // ------------------------------------------------------------
@@ -247,7 +312,6 @@ async function fetchOpenMeteoModel(lat, lon, model) {
   }
 }
 
-// Hourly backfill for the last 24h (seamless recent-history via past_days).
 async function fetchBackfillHourly(lat, lon) {
   try {
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,relative_humidity_2m,dew_point_2m,surface_pressure&past_days=1&forecast_days=1&models=best_match`;
@@ -266,8 +330,7 @@ async function fetchBackfillHourly(lat, lon) {
       const rh = h.relative_humidity_2m?.[i] ?? null;
       const pressureHpa = h.surface_pressure?.[i] ?? null;
       points.push({
-        t: h.time[i],
-        tempC, rh, pressureHpa,
+        t: h.time[i], tempC, rh, pressureHpa,
         da: densityAltitudeFt(pressureHpa, tempC),
         ratio: airDensityRatio(pressureHpa, tempC, rh),
         vaporHpa: vaporPressureHpa(tempC, rh),
@@ -279,7 +342,6 @@ async function fetchBackfillHourly(lat, lon) {
   }
 }
 
-// 15-minute-step short-range forecast (single model — best match — for the next ~2h).
 async function fetchForecast15(lat, lon) {
   try {
     const vars = 'temperature_2m,relative_humidity_2m,dew_point_2m,surface_pressure,wind_speed_10m,wind_direction_10m';
@@ -293,15 +355,14 @@ async function fetchForecast15(lat, lon) {
     const rows = [];
     for (let i = 0; i < m.time.length && rows.length < 8; i++) {
       const t = new Date(m.time[i]).getTime();
-      if (t < now - 10 * 60 * 1000) continue; // skip anything already in the past
+      if (t < now - 10 * 60 * 1000) continue;
       const tempC = m.temperature_2m?.[i] ?? null;
       const rh = m.relative_humidity_2m?.[i] ?? null;
       const pressureHpa = m.surface_pressure?.[i] ?? null;
       const windKmh = m.wind_speed_10m?.[i] ?? null;
       const windDeg = m.wind_direction_10m?.[i] ?? null;
       rows.push({
-        t: m.time[i],
-        tempC, rh, pressureHpa, windKmh, windDeg,
+        t: m.time[i], tempC, rh, pressureHpa, windKmh, windDeg,
         da: densityAltitudeFt(pressureHpa, tempC),
         ratio: airDensityRatio(pressureHpa, tempC, rh),
         vaporHpa: vaporPressureHpa(tempC, rh),
@@ -332,7 +393,7 @@ function setBulb(i, state) {
 }
 
 // ------------------------------------------------------------
-// History storage (localStorage, per rounded lat/lon)
+// History storage
 // ------------------------------------------------------------
 
 function getRecordedHistory(loc) {
@@ -366,14 +427,15 @@ function maybeRecordHistory(loc, avg) {
 // Heading storage
 // ------------------------------------------------------------
 
-function getHeading(loc) {
+function getStoredHeading(loc) {
   const stored = localStorage.getItem(HEADING_PREFIX + locKey(loc));
   if (stored !== null && stored !== '') return Number(stored);
-  return loc.heading ?? null;
+  return null;
 }
 function setHeading(loc, deg) {
   localStorage.setItem(HEADING_PREFIX + locKey(loc), String(deg));
   loc.heading = deg;
+  loc.headingIsGuess = false;
 }
 
 // ------------------------------------------------------------
@@ -383,13 +445,31 @@ function setHeading(loc, deg) {
 async function loadLocation(loc) {
   if (autoRefreshTimer) clearInterval(autoRefreshTimer);
   currentLocation = loc;
-  currentLocation.heading = getHeading(loc);
+
+  const stored = getStoredHeading(loc);
+  if (stored !== null) {
+    currentLocation.heading = stored;
+    currentLocation.headingIsGuess = false;
+  } else if (loc._geojson) {
+    const guess = suggestHeadingFromGeojson(loc._geojson);
+    if (guess !== null) {
+      currentLocation.heading = Math.round(guess);
+      currentLocation.headingIsGuess = true;
+    } else {
+      currentLocation.heading = null;
+      currentLocation.headingIsGuess = false;
+    }
+  } else {
+    currentLocation.heading = loc.heading ?? null;
+    currentLocation.headingIsGuess = false;
+  }
 
   emptyState.classList.add('hidden');
   readout.classList.remove('hidden');
   refreshBtn.disabled = false;
   saveBtn.disabled = false;
   headingInput.value = currentLocation.heading ?? '';
+  updateHeadingNote();
 
   locationName.textContent = loc.name;
   const metaParts = [];
@@ -400,6 +480,8 @@ async function loadLocation(loc) {
   }
   metaParts.push(`${loc.lat.toFixed(3)}, ${loc.lon.toFixed(3)}`);
   locationMeta.textContent = metaParts.join(' · ');
+
+  radarFrame.src = `https://embed.windy.com/embed2.html?lat=${loc.lat}&lon=${loc.lon}&detailLat=${loc.lat}&detailLon=${loc.lon}&zoom=8&level=surface&overlay=radar&product=radar&menu=&message=&marker=true&calendar=now&pressure=&type=map&location=coordinates&detail=&metricWind=mph&metricTemp=%C2%B0F&radarRange=-1`;
 
   const jobs = [fetchNWS(loc.lat, loc.lon), ...OPEN_METEO_MODELS.map((m) => fetchOpenMeteoModel(loc.lat, loc.lon, m))];
   buildBulbs(jobs.length);
@@ -422,6 +504,7 @@ async function loadLocation(loc) {
   renderResults(results);
   renderForecastTable(forecast);
   renderHistoryChart();
+  checkAlerts();
 
   autoRefreshTimer = setInterval(() => loadLocation(currentLocation), RECORD_INTERVAL_MS);
 }
@@ -450,7 +533,6 @@ function renderResults(results) {
     sourceCount: okResults.length,
   };
 
-  // ---- key metrics ----
   daValue.textContent = da !== null ? Math.round(da).toLocaleString() : '—';
   daNote.textContent = da !== null
     ? `From averaged station pressure and temperature across ${okResults.length} source${okResults.length === 1 ? '' : 's'}.`
@@ -462,7 +544,6 @@ function renderResults(results) {
   humidityValueEl.textContent = avgRh !== null ? `${fmt(avgRh, 0)}%` : '—';
   pressureAltEl.textContent = pa !== null ? `${Math.round(pa).toLocaleString()} ft` : '—';
 
-  // ---- averaged conditions row ----
   avgSourceCount.textContent = `· averaged across ${okResults.length} source${okResults.length === 1 ? '' : 's'}`;
   avgGrid.innerHTML = '';
   const avgItems = [
@@ -478,7 +559,6 @@ function renderResults(results) {
     avgGrid.appendChild(div);
   });
 
-  // ---- source cards ----
   sourcesGrid.innerHTML = '';
   results.forEach((r) => {
     const card = document.createElement('div');
@@ -533,7 +613,6 @@ function buildWindDiagramSVG(trackHeading, windFromDeg, windSpeedMph) {
     <marker id="arrBlue" markerWidth="7" markerHeight="7" refX="3.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="var(--blue)"/></marker>
   </defs>`;
   svg += `<circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="var(--hairline)" stroke-width="1.5"/>`;
-  // compass ticks
   [['N', 0], ['E', 90], ['S', 180], ['W', 270]].forEach(([label, deg]) => {
     const [tx, ty] = polar(cx, cy, R + 14, deg);
     svg += `<text x="${tx}" y="${ty}" fill="var(--text-faint)" font-size="10" font-family="JetBrains Mono, monospace" text-anchor="middle" dominant-baseline="middle">${label}</text>`;
@@ -560,6 +639,15 @@ function buildWindDiagramSVG(trackHeading, windFromDeg, windSpeedMph) {
   return svg;
 }
 
+function updateHeadingNote() {
+  if (currentLocation?.headingIsGuess) {
+    headingNoteEl.textContent = 'Auto-detected from the mapped track outline — the direction may be reversed. Verify, use ⟲ Flip if needed, then click Set to lock it in.';
+    headingNoteEl.classList.remove('hidden');
+  } else {
+    headingNoteEl.classList.add('hidden');
+  }
+}
+
 function renderWindPanel() {
   if (!lastAveraged || !currentLocation) return;
   const heading = currentLocation.heading;
@@ -571,7 +659,7 @@ function renderWindPanel() {
   const rel = windRelative(heading, windDeg, windMph);
   windGridEl.innerHTML = '';
   const items = [
-    ['Track Heading', heading !== null && heading !== undefined ? `${Math.round(heading)}° (${compassLabel(heading)})` : 'Not set'],
+    ['Track Heading', heading !== null && heading !== undefined ? `${Math.round(heading)}° (${compassLabel(heading)})${currentLocation.headingIsGuess ? ' · guess' : ''}` : 'Not set'],
     ['Wind (avg)', windMph !== null ? `${fmt(windMph, 0)} mph @ ${windDeg !== null ? Math.round(windDeg) + '°' : '—'}` : '—'],
     ['Head / Tailwind', rel ? `${fmt(Math.abs(rel.headTail), 1)} mph ${rel.headTail >= 0 ? 'tailwind' : 'headwind'}` : '—'],
     ['Crosswind', rel ? `${fmt(Math.abs(rel.cross), 1)} mph ${rel.cross >= 0 ? '(L→R)' : '(R→L)'}` : '—'],
@@ -591,7 +679,14 @@ headingSaveBtn.addEventListener('click', () => {
     return;
   }
   setHeading(currentLocation, val);
+  updateHeadingNote();
   renderWindPanel();
+});
+
+headingFlipBtn.addEventListener('click', () => {
+  const cur = Number(headingInput.value);
+  if (Number.isNaN(cur)) return;
+  headingInput.value = (cur + 180) % 360;
 });
 
 (function buildHeadingPresets() {
@@ -633,36 +728,15 @@ function renderHistoryChart() {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   if (historyChartInstance) historyChartInstance.destroy();
-
-  if (!sortedKeys.length) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    return;
-  }
+  if (!sortedKeys.length) { ctx.clearRect(0, 0, canvas.width, canvas.height); return; }
 
   historyChartInstance = new Chart(ctx, {
     type: 'line',
     data: {
       labels,
       datasets: [
-        {
-          label: 'Backfill (hourly)',
-          data: backfillData,
-          borderColor: '#565B64',
-          borderDash: [4, 3],
-          pointRadius: 0,
-          spanGaps: true,
-          tension: 0.25,
-        },
-        {
-          label: 'Recorded (live, 5 min)',
-          data: recordedData,
-          borderColor: '#FFB300',
-          backgroundColor: 'rgba(255,179,0,0.08)',
-          pointRadius: 2,
-          spanGaps: true,
-          tension: 0.25,
-          fill: true,
-        },
+        { label: 'Backfill (hourly)', data: backfillData, borderColor: '#565B64', borderDash: [4, 3], pointRadius: 0, spanGaps: true, tension: 0.25 },
+        { label: 'Recorded (live, 5 min)', data: recordedData, borderColor: '#FFB300', backgroundColor: 'rgba(255,179,0,0.08)', pointRadius: 2, spanGaps: true, tension: 0.25, fill: true },
       ],
     },
     options: {
@@ -724,7 +798,7 @@ function classifyNominatim(d) {
 }
 
 async function fetchNominatim(query) {
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=jsonv2&limit=6&addressdetails=1`;
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=jsonv2&limit=6&addressdetails=1&polygon_geojson=1`;
   const res = await fetch(url);
   if (!res.ok) return [];
   const data = await res.json();
@@ -737,6 +811,7 @@ async function fetchNominatim(query) {
     elevationM: null,
     tag: classifyNominatim(d),
     fullLabel: d.display_name,
+    geojson: d.geojson || null,
   }));
 }
 
@@ -752,7 +827,12 @@ async function fetchOpenMeteoGeocode(query) {
     elevationM: r.elevation ?? null,
     tag: 'place',
     fullLabel: [r.name, r.admin1, r.country].filter(Boolean).join(', '),
+    geojson: null,
   }));
+}
+
+function toLoc(r) {
+  return { name: r.name, admin: r.admin, country: r.country, lat: r.lat, lon: r.lon, elevationM: r.elevationM, heading: null, _geojson: r.geojson || null };
 }
 
 async function runSearch(query) {
@@ -787,7 +867,7 @@ function renderSearchResults(results) {
     div.addEventListener('click', () => {
       searchResults.classList.add('hidden');
       searchInput.value = r.name;
-      loadLocation({ name: r.name, admin: r.admin, country: r.country, lat: r.lat, lon: r.lon, elevationM: r.elevationM, heading: null });
+      loadLocation(toLoc(r));
     });
     searchResults.appendChild(div);
   });
@@ -801,6 +881,42 @@ searchInput.addEventListener('input', (e) => {
 searchInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(searchInput.value); });
 searchBtn.addEventListener('click', () => runSearch(searchInput.value));
 document.addEventListener('click', (e) => { if (!e.target.closest('.search-wrap')) searchResults.classList.add('hidden'); });
+
+// ------------------------------------------------------------
+// Quick picks (international + US tracks, resolved live)
+// ------------------------------------------------------------
+
+function buildQuickPickChip(name) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'quick-pick-chip';
+  btn.textContent = name.split(' ').slice(0, 3).join(' ').replace(/,$/, '');
+  btn.title = name;
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = 'Finding…';
+    try {
+      let results = await fetchNominatim(name);
+      if (!results.length) results = await fetchOpenMeteoGeocode(name);
+      if (!results.length) { alert(`Couldn't find "${name}". Try searching manually.`); return; }
+      quickPicksPanel.classList.add('hidden');
+      searchInput.value = results[0].name;
+      loadLocation(toLoc(results[0]));
+    } catch (e) {
+      alert(`Search failed for "${name}".`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  });
+  return btn;
+}
+
+QUICK_TRACKS_US.forEach((name) => quickPicksUSEl.appendChild(buildQuickPickChip(name)));
+QUICK_TRACKS_INTL.forEach((name) => quickPicksIntlEl.appendChild(buildQuickPickChip(name)));
+
+quickPicksToggle.addEventListener('click', () => quickPicksPanel.classList.toggle('hidden'));
 
 // ------------------------------------------------------------
 // Geolocation
@@ -819,7 +935,7 @@ geoBtn.addEventListener('click', () => {
 });
 
 // ------------------------------------------------------------
-// Saved tracks (localStorage)
+// Saved tracks
 // ------------------------------------------------------------
 
 function getSaved() {
@@ -858,12 +974,103 @@ saveBtn.addEventListener('click', () => {
   const saved = getSaved();
   const exists = saved.some((l) => Math.abs(l.lat - currentLocation.lat) < 0.001 && Math.abs(l.lon - currentLocation.lon) < 0.001);
   if (exists) return;
-  saved.push(currentLocation);
+  const { _geojson, ...toSave } = currentLocation; // don't bloat storage with geometry
+  saved.push(toSave);
   setSaved(saved);
   renderSavedPills();
 });
 
 refreshBtn.addEventListener('click', () => { if (currentLocation) loadLocation(currentLocation); });
+
+// ------------------------------------------------------------
+// Email / text alerts (EmailJS — free, client-side, no backend)
+// ------------------------------------------------------------
+
+function getAlertConfig() {
+  try { return JSON.parse(localStorage.getItem(ALERT_CONFIG_KEY)) || {}; } catch { return {}; }
+}
+function setAlertConfig(cfg) { localStorage.setItem(ALERT_CONFIG_KEY, JSON.stringify(cfg)); }
+
+function loadAlertUI() {
+  const cfg = getAlertConfig();
+  alertPublicKey.value = cfg.publicKey || '';
+  alertServiceId.value = cfg.serviceId || '';
+  alertTemplateId.value = cfg.templateId || '';
+  alertTo.value = cfg.to || '';
+  alertHigh.value = cfg.high ?? '';
+  alertLow.value = cfg.low ?? '';
+  alertEnabled.checked = !!cfg.enabled;
+}
+loadAlertUI();
+
+alertsToggle.addEventListener('click', () => alertsPanel.classList.toggle('hidden'));
+
+alertSaveBtn.addEventListener('click', () => {
+  const cfg = {
+    publicKey: alertPublicKey.value.trim(),
+    serviceId: alertServiceId.value.trim(),
+    templateId: alertTemplateId.value.trim(),
+    to: alertTo.value.trim(),
+    high: alertHigh.value !== '' ? Number(alertHigh.value) : null,
+    low: alertLow.value !== '' ? Number(alertLow.value) : null,
+    enabled: alertEnabled.checked,
+  };
+  setAlertConfig(cfg);
+  if (cfg.publicKey && typeof emailjs !== 'undefined') {
+    try { emailjs.init(cfg.publicKey); } catch (e) { /* ignore */ }
+  }
+  alertStatus.textContent = 'Settings saved to this browser.';
+});
+
+async function sendAlertEmail(cfg, subject, message) {
+  if (typeof emailjs === 'undefined') throw new Error('EmailJS failed to load');
+  emailjs.init(cfg.publicKey);
+  return emailjs.send(cfg.serviceId, cfg.templateId, {
+    to_email: cfg.to,
+    subject,
+    message,
+  });
+}
+
+alertTestBtn.addEventListener('click', async () => {
+  const cfg = getAlertConfig();
+  if (!cfg.publicKey || !cfg.serviceId || !cfg.templateId || !cfg.to) {
+    alertStatus.textContent = 'Fill in all four EmailJS fields first, then Save settings.';
+    return;
+  }
+  alertStatus.textContent = 'Sending test…';
+  try {
+    await sendAlertEmail(cfg, 'DA/RAW test alert', `Test alert from DA/RAW${currentLocation ? ' for ' + currentLocation.name : ''}. If you got this, alerts are wired up correctly.`);
+    alertStatus.textContent = 'Test sent — check your inbox (or phone, if using a carrier gateway).';
+  } catch (e) {
+    alertStatus.textContent = `Send failed: ${e?.text || e?.message || 'unknown error'}. Double-check your Service ID, Template ID, and Public Key.`;
+  }
+});
+
+async function checkAlerts() {
+  const cfg = getAlertConfig();
+  if (!cfg.enabled || !cfg.publicKey || !cfg.serviceId || !cfg.templateId || !cfg.to || !currentLocation || !lastAveraged) return;
+  if (lastAveraged.da === null) return;
+
+  let triggered = null;
+  if (cfg.high !== null && cfg.high !== undefined && lastAveraged.da > cfg.high) {
+    triggered = `Density altitude at ${currentLocation.name} is ${Math.round(lastAveraged.da).toLocaleString()} ft — above your ${cfg.high.toLocaleString()} ft threshold.`;
+  } else if (cfg.low !== null && cfg.low !== undefined && lastAveraged.da < cfg.low) {
+    triggered = `Density altitude at ${currentLocation.name} is ${Math.round(lastAveraged.da).toLocaleString()} ft — below your ${cfg.low.toLocaleString()} ft threshold.`;
+  }
+  if (!triggered) return;
+
+  const cooldownKey = ALERT_LAST_SENT_PREFIX + locKey(currentLocation);
+  const last = Number(localStorage.getItem(cooldownKey) || 0);
+  if (Date.now() - last < ALERT_COOLDOWN_MS) return;
+
+  try {
+    await sendAlertEmail(cfg, 'DA/RAW alert', triggered);
+    localStorage.setItem(cooldownKey, String(Date.now()));
+  } catch (e) {
+    // Fail silently in the background loop; the test button surfaces setup errors.
+  }
+}
 
 // ------------------------------------------------------------
 // Init
