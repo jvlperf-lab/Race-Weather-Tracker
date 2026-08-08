@@ -29,8 +29,21 @@ Pages → Deploy from branch `main` / root.
 
 ## What's on the page
 
+Sections run weather-first: hero numbers, averaged conditions, source
+breakdown, *then* wind/track.
+
 - **Density altitude**, **air density ratio**, **correction factor**
-  (SAE J1349), **vapor pressure**, **station baro**, and **humidity**.
+  (ρ₀/ρ — see below), **vapor pressure**, **station baro**, and
+  **humidity**, up top.
+- **Averaged conditions** and a full **source breakdown**, labeled
+  generically as Station 1–9 rather than by name. Each station has an
+  "include in average" checkbox — untick one and the whole page
+  recomputes instantly from the same data, no refetch. A source's
+  pressure is also automatically dropped from the average (just the
+  average — the rest of its readings still count) if it's a clear
+  outlier vs. the others, which is exactly what happens when one
+  source reports corrected/sea-level pressure instead of actual
+  station pressure.
 - **Wind vs. track**: set a starting-line heading and get headwind/
   tailwind and crosswind, plus a compass diagram marking START/FINISH.
   If you pick a track from search that OpenStreetMap has mapped as a
@@ -39,9 +52,12 @@ Pages → Deploy from branch `main` / root.
   (OSM doesn't encode which end is the starting line), so verify it,
   flip it if needed, and click Set to lock it in. Once set, it's
   remembered automatically for that location.
-- **Averaged conditions** and full **source breakdown**.
-- **Last 24 hours**: hourly backfill (dashed) + a live line recorded
-  every 5 minutes while the page is open (solid).
+- **Last 24 hours**: for US locations, the dashed line is **real NWS
+  station observation history** — actual archived instrument readings,
+  not a model guess. Outside the US (or if a station has no history
+  endpoint), it falls back to the forecast model's reconstruction of
+  the last 24h, clearly labeled as such. The solid line is recorded
+  live, every 5 minutes, while the page is open.
 - **Next two hours**: 15-minute-step forecast table.
 - **Track/venue search + quick picks**: search covers the whole world
   (OpenStreetMap Nominatim for venues, Open-Meteo's geocoder for
@@ -51,9 +67,81 @@ Pages → Deploy from branch `main` / root.
   hardcoded coordinates, so it's never silently wrong.
 - **Radar**: an embedded Windy.com panel centered on your location,
   showing recent + near-term precipitation radar.
-- **Email/text alerts**: optional, off by default, set up per browser.
+- **Email/text alerts and routine updates**: optional, off by default.
+  The in-page panel only runs while the tab is open; the GitHub Actions
+  workflow below runs regardless.
 
-## Setting up alerts (optional)
+## Always-on alerts (recommended) — runs even with the browser closed
+
+The in-page "Email / Text Alerts" panel below only works while the site
+is open in a tab, because a static site has nothing running in the
+background. To get real always-on alerts, this repo also includes a
+scheduled **GitHub Actions** workflow — three extra files
+(`.github/workflows/alert-check.yml`, `scripts/check-alert.mjs`,
+`alert-config.json`) that check the weather and email/text you on a
+timer, whether your laptop is on or not. It's free (GitHub Actions is
+unlimited for public repos on standard runners) and uses the GitHub
+repo you already have — no new hosting account needed.
+
+**Setup:**
+
+1. **Edit `alert-config.json`** in your repo (click it → pencil icon)
+   with your track's coordinates and thresholds:
+   ```json
+   {
+     "trackName": "My Track",
+     "lat": 39.6206,
+     "lon": -75.5991,
+     "highFt": 4000,
+     "lowFt": 500,
+     "cooldownMinutes": 30,
+     "updateMinutes": 0,
+     "excludedSources": []
+   }
+   ```
+   `updateMinutes` sends a routine "here's the current weather" text on
+   that interval regardless of thresholds — set to `0` to disable, or
+   e.g. `60` for an update once an hour. `excludedSources` lets you
+   permanently drop a misbehaving source from this server-side check
+   (ids: `nws`, `best_match`, `gfs_seamless`, `icon_seamless`,
+   `ecmwf_ifs025`, `gem_seamless`, `ukmo_seamless`,
+   `meteofrance_seamless`, `jma_seamless`) — the site already does this
+   automatically for pressure outliers, but this config only applies to
+   the background script, not the browser.
+2. **Create a Gmail App Password** (requires 2-Step Verification turned
+   on for your Google account): go to
+   https://myaccount.google.com/apppasswords, create one for "Mail",
+   and copy the 16-character password it gives you.
+3. **Add three repo secrets**: Settings → Secrets and variables →
+   Actions → New repository secret:
+   - `EMAIL_USER` — your Gmail address
+   - `EMAIL_APP_PASSWORD` — the 16-character app password from step 2
+   - `EMAIL_TO` — where to send it. Use your email, or a carrier
+     email-to-SMS gateway for a text (see below).
+4. That's it. The workflow runs automatically every 15 minutes. To
+   check it's working: repo → **Actions** tab → "DA/RAW Alert Check" →
+   you should see runs appearing. You can also click **Run workflow**
+   there to trigger one immediately instead of waiting.
+
+**For a text instead of an email**, set `EMAIL_TO` to your phone
+number at your carrier's email-to-SMS gateway, e.g.
+`5551234567@vtext.com` (Verizon), `5551234567@txt.att.net` (AT&T),
+`5551234567@tmomail.net` (T-Mobile).
+
+**How it avoids spamming you**: after sending, it writes a timestamp
+to `alert-state.json` and won't send again until `cooldownMinutes` has
+passed, even if the threshold is still crossed on the next run.
+
+**Limitations**: GitHub Actions' schedule isn't to-the-second — it can
+run a few minutes late during high load, and 15 minutes is close to
+the practical floor for reliability (you can try `*/5 * * * *` in the
+workflow file, but expect more slippage). If your Google account
+doesn't support App Passwords (e.g. it's a managed Workspace account
+with restrictions), swap Gmail for any other SMTP provider by editing
+the `nodemailer.createTransport(...)` call in
+`scripts/check-alert.mjs`.
+
+## Setting up the in-page alert panel (optional, quick testing)
 
 This is a static site with no server, so it can't send anything on its
 own — it uses [EmailJS](https://www.emailjs.com/), a service built
@@ -97,12 +185,21 @@ every 5 minutes.
   equation × relative humidity.
 - **Air density ratio**: ideal gas law using actual station pressure,
   temperature, and vapor pressure.
-- **Correction factor**: SAE J1349, `CF = (99 / Pd_kPa) * sqrt(T_K /
-  298)`, `Pd` = dry-air pressure. A dyno-style automotive standard,
-  shown for cross-reference — not an NHRA index, not a substitute for
-  your own SAE/NHRA calculator.
+- **Correction factor**: `CF = 1 / air density ratio` (ρ₀/ρ) — the
+  convention most trackside racing calculators use. (An earlier version
+  of this site used the SAE J1349 dyno-correction formula instead,
+  which is a different, automotive-specific standard — that was wrong
+  for this context and has been replaced. Verified against a
+  known-good reference calculation: 78.4°F / 80% RH / 29.15" uncorrected
+  baro gives CF ≈ 1.076 either way, within rounding.)
 - **Averaging**: arithmetic mean per field across whichever sources
-  answered, except wind direction, which uses a circular mean.
+  answered, except wind direction (circular mean) and pressure, which
+  gets outlier rejection first — any source whose pressure differs from
+  the group median by more than ~0.15 inHg is dropped from the pressure
+  average only (that source's temp/humidity/wind still count). This is
+  what catches a source reporting corrected/sea-level pressure instead
+  of station pressure. You can also manually exclude any source via the
+  checkbox on its card.
 - **Head/tailwind & crosswind**: resolved from the averaged wind vector
   against your saved starting-line heading.
 
@@ -111,9 +208,10 @@ every 5 minutes.
 - **NWS station data is US-only**; elsewhere that source shows red and
   the average leans on the eight Open-Meteo models — which is exactly
   why "as many sources as possible" matters more outside the US.
-- **True 5-minute historical data doesn't exist for free, retroactively.**
-  On load you get an hourly backfill for the trailing 24h; from then
-  on the page itself records a point every 5 minutes into local
+- **True 5-minute historical data doesn't exist for free, retroactively,
+  even from the real NWS station history** — stations report at their
+  own native interval (often hourly, sometimes better). From load
+  onward the page itself records a point every 5 minutes into local
   storage, so history genuinely deepens the longer you leave it open.
 - **The forecast table uses a single model** (best-match), not the
   full multi-source average — running nine sources at 15-minute
