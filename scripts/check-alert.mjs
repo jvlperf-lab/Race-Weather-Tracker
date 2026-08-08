@@ -114,12 +114,21 @@ async function readJson(url, fallback) {
   try { return JSON.parse(await fs.readFile(url, 'utf8')); } catch { return fallback; }
 }
 
+// Uses Brevo's free SMTP relay (300 emails/day free, no Gmail App
+// Password headaches). EMAIL_USER = your Brevo login email,
+// EMAIL_APP_PASSWORD = your Brevo SMTP key (from brevo.com dashboard
+// → SMTP & API), EMAIL_TO = where alerts go.
 async function sendMail(env, subject, text) {
   const { EMAIL_USER, EMAIL_APP_PASSWORD, EMAIL_TO } = env;
   if (!EMAIL_USER || !EMAIL_APP_PASSWORD || !EMAIL_TO) {
     throw new Error('Missing EMAIL_USER / EMAIL_APP_PASSWORD / EMAIL_TO secrets.');
   }
-  const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: EMAIL_USER, pass: EMAIL_APP_PASSWORD } });
+  const transporter = nodemailer.createTransport({
+    host: 'smtp-relay.brevo.com',
+    port: 587,
+    secure: false,
+    auth: { user: EMAIL_USER, pass: EMAIL_APP_PASSWORD },
+  });
   await transporter.sendMail({ from: EMAIL_USER, to: EMAIL_TO, subject, text });
 }
 
