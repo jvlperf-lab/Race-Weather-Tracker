@@ -1,0 +1,10 @@
+{
+  "trackName": "My Track",
+  "lat": 39.6206,
+  "lon": -75.5991,
+  "highFt": 4000,
+  "lowFt": 500,
+  "cooldownMinutes": 30,
+  "updateMinutes": 0,
+  "excludedSources": []
+}
