@@ -85,7 +85,7 @@
           <span id="densityRatio" class="key-metric-value">—</span>
         </div>
         <div class="key-metric">
-          <span class="key-metric-label">Correction Factor <em>SAE J1349</em></span>
+          <span class="key-metric-label">Correction Factor <em>ρ₀/ρ</em></span>
           <span id="correctionFactor" class="key-metric-value">—</span>
         </div>
         <div class="key-metric">
@@ -105,6 +105,16 @@
           <span id="pressureAlt" class="key-metric-value">—</span>
         </div>
       </div>
+    </div>
+
+    <div class="averaged-row" id="averagedRow">
+      <div class="avg-title">Averaged Conditions <span id="avgSourceCount" class="avg-title-sub"></span></div>
+      <div class="avg-grid" id="avgGrid"></div>
+    </div>
+
+    <div class="sources-block">
+      <div class="sources-title">Source Breakdown</div>
+      <div class="sources-grid" id="sourcesGrid"></div>
     </div>
 
     <div class="wind-block">
@@ -127,16 +137,6 @@
       </div>
     </div>
 
-    <div class="averaged-row" id="averagedRow">
-      <div class="avg-title">Averaged Conditions <span id="avgSourceCount" class="avg-title-sub"></span></div>
-      <div class="avg-grid" id="avgGrid"></div>
-    </div>
-
-    <div class="sources-block">
-      <div class="sources-title">Source Breakdown</div>
-      <div class="sources-grid" id="sourcesGrid"></div>
-    </div>
-
     <div class="history-block">
       <div class="panel-title-row">
         <div class="panel-title">Last 24 Hours</div>
@@ -149,7 +149,7 @@
           <option value="vapor">Vapor Pressure</option>
         </select>
       </div>
-      <p class="panel-note">Dashed = hourly backfill from the model archive. Solid = recorded live, every 5 minutes, while this page stays open in your browser.</p>
+      <p id="historyNote" class="panel-note">Loading…</p>
       <div class="chart-wrap"><canvas id="historyChart" height="90"></canvas></div>
     </div>
 
@@ -179,7 +179,7 @@
         <div class="panel-title">Email / Text Alerts</div>
         <button id="alertsToggle" class="btn-outline small">Configure</button>
       </div>
-      <p class="panel-note">Runs entirely in your browser via <a href="https://www.emailjs.com/" target="_blank" rel="noopener">EmailJS</a> — free, no backend. Only fires while this page is open and auto-refreshing (every 5 min). For a text instead of an email, put your carrier's email-to-SMS address in the notify field (e.g. <code>5551234567@vtext.com</code> for Verizon, <code>@txt.att.net</code> AT&amp;T, <code>@tmomail.net</code> T-Mobile).</p>
+      <p class="panel-note">Runs entirely in your browser via <a href="https://www.emailjs.com/" target="_blank" rel="noopener">EmailJS</a> — free, no backend. Only fires while this page is open and auto-refreshing (every 5 min); for always-on alerts and routine updates that work with the page closed, see the GitHub Actions setup in the README. For a text instead of an email, put your carrier's email-to-SMS address in the notify field (e.g. <code>5551234567@vtext.com</code> for Verizon, <code>@txt.att.net</code> AT&amp;T, <code>@tmomail.net</code> T-Mobile).</p>
 
       <div id="alertsPanel" class="alerts-panel hidden">
         <div class="alerts-grid">
@@ -189,6 +189,7 @@
           <label>Notify address <input id="alertTo" type="text" placeholder="you@email.com or phone@carrier gateway"></label>
           <label>Alert if DA rises above (ft) <input id="alertHigh" type="number" placeholder="e.g. 4000"></label>
           <label>Alert if DA falls below (ft) <input id="alertLow" type="number" placeholder="e.g. 500"></label>
+          <label>Routine update every (min, blank = off) <input id="alertUpdateMinutes" type="number" placeholder="e.g. 60"></label>
         </div>
         <div class="alerts-actions">
           <label class="alerts-enable"><input type="checkbox" id="alertEnabled"> Enable alerts for this browser</label>
@@ -204,7 +205,7 @@
 </main>
 
 <footer class="site-footer">
-  <p>Data: National Weather Service (station observations, US only) and Open-Meteo (best-match, NOAA GFS, DWD ICON, ECMWF IFS, ECCC GEM, UK Met Office, Météo-France, JMA). Track/venue search uses OpenStreetMap Nominatim (© OpenStreetMap contributors) alongside Open-Meteo's geocoder. Radar via Windy.com. Density altitude uses the standard pressure-altitude + ISA lapse-rate approximation; air density ratio comes from actual station pressure, temperature and humidity via the ideal gas law; the correction factor uses SAE J1349 (99 kPa / 298 K reference). These are field-reference numbers — cross-check against your own NHRA/SAE calculator before making a tuning call.</p>
+  <p>Data: National Weather Service (station observations and history, US only) and Open-Meteo (best-match, NOAA GFS, DWD ICON, ECMWF IFS, ECCC GEM, UK Met Office, Météo-France, JMA). Track/venue search uses OpenStreetMap Nominatim (© OpenStreetMap contributors) alongside Open-Meteo's geocoder. Radar via Windy.com. Density altitude uses the standard pressure-altitude + ISA lapse-rate approximation; air density ratio comes from actual station pressure, temperature and humidity via the ideal gas law; correction factor is the reciprocal of air density ratio (ρ₀/ρ), the convention most trackside calculators use. A source's pressure is automatically dropped from the average if it looks like corrected/sea-level pressure rather than station pressure, and any source can be excluded manually from its card. These are field-reference numbers — cross-check against your own NHRA/SAE calculator before making a tuning call.</p>
 </footer>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
