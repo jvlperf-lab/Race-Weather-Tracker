@@ -5,6 +5,6 @@
   "highFt": 4000,
   "lowFt": 500,
   "cooldownMinutes": 30,
-  "updateMinutes": 0,
+  "updateMinutes": 1,
   "excludedSources": []
 }
