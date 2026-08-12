@@ -21,7 +21,7 @@ const OPEN_METEO_MODELS = [
   { id: 'meteofrance_seamless' },
   { id: 'jma_seamless' },
 ];
-const CURRENT_VARS = 'temperature_2m,relative_humidity_2m,surface_pressure';
+const CURRENT_VARS = 'temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m';
 
 const CONFIG_PATH = new URL('../alert-config.json', import.meta.url);
 const STATE_PATH = new URL('../alert-state.json', import.meta.url);
@@ -72,6 +72,22 @@ function rejectPressureOutliers(entries) {
   return valid.filter((e) => Math.abs(e.value - median) <= 5); // ~0.15 inHg
 }
 
+function circularMeanDeg(degs) {
+  const vals = degs.filter((d) => d !== null && d !== undefined);
+  if (!vals.length) return null;
+  let sinSum = 0, cosSum = 0;
+  vals.forEach((d) => {
+    const r = (d * Math.PI) / 180;
+    sinSum += Math.sin(r);
+    cosSum += Math.cos(r);
+  });
+  let mean = (Math.atan2(sinSum / vals.length, cosSum / vals.length) * 180) / Math.PI;
+  if (mean < 0) mean += 360;
+  return mean;
+}
+function kmh2mph(k) { return k * 0.621371; }
+function hpa2inHg(h) { return h * 0.0295299831; }
+
 async function fetchNWS(lat, lon) {
   try {
     const pointRes = await fetch(`https://api.weather.gov/points/${lat.toFixed(4)},${lon.toFixed(4)}`);
@@ -90,6 +106,8 @@ async function fetchNWS(lat, lon) {
       tempC: p.temperature?.value ?? null,
       rh: p.relativeHumidity?.value ?? null,
       pressureHpa: p.barometricPressure?.value != null ? p.barometricPressure.value / 100 : null,
+      windKmh: p.windSpeed?.value ?? null,
+      windDeg: p.windDirection?.value ?? null,
     };
   } catch (e) {
     return { id: 'nws', ok: false, error: e.message };
@@ -104,7 +122,7 @@ async function fetchOpenMeteoModel(lat, lon, model) {
     const data = await res.json();
     const c = data.current;
     if (!c) throw new Error('no current data');
-    return { id: model.id, ok: true, tempC: c.temperature_2m ?? null, rh: c.relative_humidity_2m ?? null, pressureHpa: c.surface_pressure ?? null };
+    return { id: model.id, ok: true, tempC: c.temperature_2m ?? null, rh: c.relative_humidity_2m ?? null, pressureHpa: c.surface_pressure ?? null, windKmh: c.wind_speed_10m ?? null, windDeg: c.wind_direction_10m ?? null };
   } catch (e) {
     return { id: model.id, ok: false, error: e.message };
   }
@@ -118,48 +136,11 @@ async function readJson(url, fallback) {
 // Password headaches). EMAIL_USER = your Brevo login email,
 // EMAIL_APP_PASSWORD = your Brevo SMTP key (from brevo.com dashboard
 // → SMTP & API), EMAIL_TO = where alerts go.
-async function sendMail(env, subject, text) {
-  const { EMAIL_USER, EMAIL_APP_PASSWORD, EMAIL_TO } = env;
-  if (!EMAIL_USER || !EMAIL_APP_PASSWORD || !EMAIL_TO) {
-    throw new Error('Missing EMAIL_USER / EMAIL_APP_PASSWORD / EMAIL_TO secrets.');
-  }
-  const transporter = nodemailer.createTransport({
-    host: 'smtp-relay.brevo.com',
-    port: 587,
-    secure: false,
-    auth: { user: EMAIL_USER, pass: EMAIL_APP_PASSWORD },
-  });
-  await transporter.sendMail({ from: EMAIL_USER, to: EMAIL_TO, subject, text });
-}
-
-async function main() {
-  const config = await readJson(CONFIG_PATH, null);
-  if (!config) throw new Error('alert-config.json missing or invalid');
-  const { trackName, lat, lon, highFt, lowFt, cooldownMinutes, updateMinutes, excludedSources } = config;
-  const excluded = new Set(excludedSources || []);
-
-  const jobs = [fetchNWS(lat, lon), ...OPEN_METEO_MODELS.map((m) => fetchOpenMeteoModel(lat, lon, m))];
-  const results = await Promise.all(jobs);
-  const ok = results.filter((r) => r.ok && !excluded.has(r.id));
-  console.log(`Sources in average: ${ok.length}/${results.length} (${results.filter((r) => !r.ok).length} unavailable, ${excluded.size} manually excluded)`);
-
-  const avgTempC = average(ok.map((r) => r.tempC));
-  const avgRh = average(ok.map((r) => r.rh));
-  const pressureKept = rejectPressureOutliers(ok.map((r) => ({ id: r.id, value: r.pressureHpa })));
-  if (pressureKept.length < ok.filter((r) => r.pressureHpa !== null).length) {
-    console.log('Dropped a pressure outlier from the average (likely corrected/sea-level pressure).');
-  }
-  const avgPressureHpa = average(pressureKept.map((e) => e.value));
-
-  const da = densityAltitudeFt(avgPressureHpa, avgTempC);
-  const ratio = airDensityRatio(avgPressureHpa, avgTempC, avgRh);
-  const cf = correctionFactor(ratio);
-
-  if (da === null) {
-    console.log('Not enough source data to compute density altitude — skipping.');
-    return;
-  }
-  console.log(`${trackName}: DA ${Math.round(da)} ft, ratio ${ratio !== null ? (ratio * 100).toFixed(1) + '%' : 'n/a'}, CF ${cf !== null ? cf.toFixed(3) : 'n/a'}`);
+async function sendMail(env, subject, text, html) {
+  const { EMAIL_USER, EMAIL_APP_PASSWORD, EMAIL_TO ,
+    humidity: avgRh !== null ? `${avgRh.toFixed(0)}%` : '—',
+    wind: avgWindKmh !== null ? `${kmh2mph(avgWindKmh).toFixed(0)} mph${avgWindDeg !== null ? ' @ ' + Math.round(avgWindDeg) + '°' : ''}` : '—',
+  };
 
   const state = await readJson(STATE_PATH, { lastAlertAt: null, lastUpdateAt: null });
   let stateChanged = false;
@@ -174,7 +155,8 @@ async function main() {
   if (triggered) {
     const cooldownMs = (cooldownMinutes ?? 30) * 60 * 1000;
     if (!state.lastAlertAt || Date.now() - new Date(state.lastAlertAt).getTime() >= cooldownMs) {
-      await sendMail(process.env, 'DA/RAW alert', triggered);
+      const html = buildHtmlEmail({ kind: 'THRESHOLD ALERT', headline: triggered, ...fields });
+      await sendMail(process.env, 'DA/RAW alert', triggered, html);
       state.lastAlertAt = new Date().toISOString();
       stateChanged = true;
       console.log('Alert sent:', triggered);
@@ -189,15 +171,9 @@ async function main() {
   if (updateMinutes) {
     const updateMs = updateMinutes * 60 * 1000;
     if (!state.lastUpdateAt || Date.now() - new Date(state.lastUpdateAt).getTime() >= updateMs) {
-      const summary = [
-        `DA ${Math.round(da).toLocaleString()} ft`,
-        ratio !== null ? `density ${(ratio * 100).toFixed(1)}%` : null,
-        cf !== null ? `CF ${cf.toFixed(3)}` : null,
-        avgPressureHpa !== null ? `baro ${(avgPressureHpa * 0.0295299831).toFixed(2)}"` : null,
-        avgTempC !== null ? `${((avgTempC * 9) / 5 + 32).toFixed(0)}°F` : null,
-        avgRh !== null ? `${avgRh.toFixed(0)}% RH` : null,
-      ].filter(Boolean).join(', ');
-      await sendMail(process.env, 'DA/RAW weather update', `${trackName}: ${summary}.`);
+      const summaryText = `${trackName}: DA ${fields.da} ft, ratio ${fields.ratio}, CF ${fields.cf}, baro ${fields.baro}, ${fields.temp}, ${fields.humidity} RH.`;
+      const html = buildHtmlEmail({ kind: 'ROUTINE UPDATE', headline: summaryText, ...fields });
+      await sendMail(process.env, 'DA/RAW weather update', summaryText, html);
       state.lastUpdateAt = new Date().toISOString();
       stateChanged = true;
       console.log('Routine update sent.');
