@@ -1135,13 +1135,37 @@ alertSaveBtn.addEventListener('click', () => {
   alertStatus.textContent = 'Settings saved to this browser.';
 });
 
-async function sendAlertEmail(cfg, subject, message) {
+// Builds the full set of template variables for a rich, data-dense email.
+function buildEmailFields(kind, headline) {
+  const a = lastAveraged || {};
+  const heading = kind === 'alert' ? 'THRESHOLD ALERT' : kind === 'update' ? 'ROUTINE UPDATE' : 'TEST ALERT';
+  return {
+    kind: heading,
+    headline: headline || '',
+    track_name: currentLocation?.name || '—',
+    updated: new Date().toLocaleString(),
+    sources: a.sourceCount !== undefined && a.sourceCount !== null ? String(a.sourceCount) : '—',
+    da: a.da != null ? Math.round(a.da).toLocaleString() : '—',
+    ratio: a.ratio != null ? `${fmt(a.ratio * 100, 1)}%` : '—',
+    cf: a.cf != null ? fmt(a.cf, 3) : '—',
+    vapor: a.vaporHpa != null ? `${fmt(hpa2inHg(a.vaporHpa), 3)}"` : '—',
+    baro: a.pressureHpa != null ? `${fmt(hpa2inHg(a.pressureHpa), 2)}"` : '—',
+    pressure_alt: a.pa != null ? `${Math.round(a.pa).toLocaleString()} ft` : '—',
+    temp: a.tempC != null ? `${fmt(c2f(a.tempC), 0)}°F` : '—',
+    dewpoint: a.dewC != null ? `${fmt(c2f(a.dewC), 0)}°F` : '—',
+    humidity: a.rh != null ? `${fmt(a.rh, 0)}%` : '—',
+    wind: a.windKmh != null ? `${fmt(kmh2mph(a.windKmh), 0)} mph${a.windDeg != null ? ' @ ' + Math.round(a.windDeg) + '°' : ''}` : '—',
+  };
+}
+
+async function sendAlertEmail(cfg, subject, message, extraFields) {
   if (typeof emailjs === 'undefined') throw new Error('EmailJS failed to load');
   emailjs.init(cfg.publicKey);
   return emailjs.send(cfg.serviceId, cfg.templateId, {
     to_email: cfg.to,
     subject,
     message,
+    ...extraFields,
   });
 }
 
@@ -1153,7 +1177,8 @@ alertTestBtn.addEventListener('click', async () => {
   }
   alertStatus.textContent = 'Sending test…';
   try {
-    await sendAlertEmail(cfg, 'DA/RAW test alert', `Test alert from DA/RAW${currentLocation ? ' for ' + currentLocation.name : ''}. If you got this, alerts are wired up correctly.`);
+    const message = `Test alert from DA/RAW${currentLocation ? ' for ' + currentLocation.name : ''}. If you got this, alerts are wired up correctly.`;
+    await sendAlertEmail(cfg, 'DA/RAW test alert', message, buildEmailFields('test', message));
     alertStatus.textContent = 'Test sent — check your inbox (or phone, if using a carrier gateway).';
   } catch (e) {
     alertStatus.textContent = `Send failed: ${e?.text || e?.message || 'unknown error'}. Double-check your Service ID, Template ID, and Public Key.`;
@@ -1190,7 +1215,7 @@ async function checkAlertsAndUpdates() {
       const last = Number(localStorage.getItem(cooldownKey) || 0);
       if (Date.now() - last >= ALERT_COOLDOWN_MS) {
         try {
-          await sendAlertEmail(cfg, 'DA/RAW alert', triggered);
+          await sendAlertEmail(cfg, 'DA/RAW alert', triggered, buildEmailFields('alert', triggered));
           localStorage.setItem(cooldownKey, String(Date.now()));
         } catch (e) { /* surfaced via the Send test button, not the background loop */ }
       }
@@ -1203,7 +1228,8 @@ async function checkAlertsAndUpdates() {
     const lastUpdate = Number(localStorage.getItem(updateKey) || 0);
     if (Date.now() - lastUpdate >= cfg.updateMinutes * 60 * 1000) {
       try {
-        await sendAlertEmail(cfg, 'DA/RAW weather update', `${currentLocation.name}: ${conditionsSummary()}.`);
+        const message = `${currentLocation.name}: ${conditionsSummary()}.`;
+        await sendAlertEmail(cfg, 'DA/RAW weather update', message, buildEmailFields('update', message));
         localStorage.setItem(updateKey, String(Date.now()));
       } catch (e) { /* surfaced via the Send test button, not the background loop */ }
     }
