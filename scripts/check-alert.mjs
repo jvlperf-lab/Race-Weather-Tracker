@@ -128,6 +128,69 @@ async function fetchOpenMeteoModel(lat, lon, model) {
   }
 }
 
+// Short-range forecast (best-match model, 15-min steps) for the next-hour outlook.
+async function fetchForecast15(lat, lon) {
+  try {
+    const vars = 'temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m';
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&minutely_15=${vars}&models=best_match`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('forecast unavailable');
+    const data = await res.json();
+    const m = data.minutely_15;
+    if (!m || !m.time) throw new Error('no minutely data');
+    const now = Date.now();
+    const rows = [];
+    for (let i = 0; i < m.time.length && rows.length < 4; i++) {
+      const t = new Date(m.time[i]).getTime();
+      if (t < now - 10 * 60 * 1000) continue;
+      const tempC = m.temperature_2m?.[i] ?? null;
+      const pressureHpa = m.surface_pressure?.[i] ?? null;
+      const windKmh = m.wind_speed_10m?.[i] ?? null;
+      rows.push({ tempC, windKmh, da: densityAltitudeFt(pressureHpa, tempC) });
+    }
+    return rows;
+  } catch (e) {
+    return [];
+  }
+}
+
+function buildOutlook(rows) {
+  const hour = (rows || []).filter((r) => r.da !== null && r.tempC !== null);
+  if (hour.length < 2) return '';
+  const first = hour[0];
+  const last = hour[hour.length - 1];
+  const daDelta = last.da - first.da;
+  const tempDeltaF = ((last.tempC * 9) / 5 + 32) - ((first.tempC * 9) / 5 + 32);
+
+  let daTrend;
+  if (Math.abs(daDelta) < 60) daTrend = 'holding roughly steady';
+  else if (daDelta > 0) daTrend = `climbing about ${Math.round(daDelta).toLocaleString()} ft`;
+  else daTrend = `dropping about ${Math.round(Math.abs(daDelta)).toLocaleString()} ft`;
+
+  let tempTrend;
+  if (Math.abs(tempDeltaF) < 2) tempTrend = 'temps holding steady';
+  else if (tempDeltaF > 0) tempTrend = `temps warming ${Math.abs(tempDeltaF).toFixed(0)}°F`;
+  else tempTrend = `temps cooling ${Math.abs(tempDeltaF).toFixed(0)}°F`;
+
+  const windNote = last.windKmh !== null ? `, wind around ${(last.windKmh * 0.621371).toFixed(0)} mph` : '';
+  return `Next hour: density altitude ${daTrend} (${Math.round(first.da).toLocaleString()} → ${Math.round(last.da).toLocaleString()} ft), ${tempTrend}${windNote}.`;
+}
+
+function daColorScheme(da) {
+  if (da === null || da === undefined) return { bg: '#f6f6f7', accent: '#8a8f98' };
+  if (da <= 1500) return { bg: '#eaf7ee', accent: '#1f8a4c' };
+  if (da <= 3500) return { bg: '#fbf6ea', accent: '#c47f00' };
+  return { bg: '#fdeceb', accent: '#c0392b' };
+}
+
+// Magnus-formula dewpoint approximation from temp (°C) and RH (%).
+function dewpointC(tempC, rh) {
+  if (tempC === null || tempC === undefined || rh === null || rh === undefined || rh <= 0) return null;
+  const a = 17.625, b = 243.04;
+  const gamma = Math.log(rh / 100) + (a * tempC) / (b + tempC);
+  return (b * gamma) / (a - gamma);
+}
+
 async function readJson(url, fallback) {
   try { return JSON.parse(await fs.readFile(url, 'utf8')); } catch { return fallback; }
 }
@@ -150,40 +213,40 @@ async function sendMail(env, subject, text, html) {
   await transporter.sendMail({ from: EMAIL_USER, to: EMAIL_TO, subject, text, html });
 }
 
-// Same card layout as the site's EmailJS template, rendered server-side.
-function buildHtmlEmail({ kind, trackName, headline, da, ratio, cf, vapor, baro, pressureAlt, temp, dewpoint, humidity, wind, sources, updated }) {
-  const row = (label, value) => `
-    <td style="padding:12px 14px;background:#f6f6f7;border-radius:5px;">
+// Same card layout as the site's EmailJS template, with color-coded DA
+// (green/amber/red by value) and a colored left-border per metric card.
+function buildHtmlEmail({ kind, trackName, headline, da, daRaw, ratio, cf, vapor, baro, pressureAlt, temp, dewpoint, humidity, wind, sources, updated, outlook }) {
+  const colors = daColorScheme(daRaw);
+  const row = (label, value, accent) => `
+    <td style="padding:12px 14px;background:#f9f9fa;border-left:3px solid ${accent};border-radius:4px;">
       <div style="font-size:10px;letter-spacing:0.5px;text-transform:uppercase;color:#999;margin-bottom:4px;">${label}</div>
       <div style="font-size:17px;font-weight:bold;color:#222;">${value}</div>
     </td>`;
   return `
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;font-family:Arial,Helvetica,sans-serif;background:#ffffff;border:1px solid #e2e2e2;border-radius:8px;overflow:hidden;">
-  <tr><td style="background:#1b1e24;padding:20px 28px;">
+  <tr><td style="background:linear-gradient(135deg,#1b1e24,#2a2f3a);padding:20px 28px;">
     <span style="color:#ffb300;font-weight:bold;font-size:20px;">DA<span style="color:#8a8f98;">/</span>RAW</span>
     <div style="color:#9aa0ab;font-size:11px;letter-spacing:1px;text-transform:uppercase;margin-top:4px;">${kind}</div>
   </td></tr>
   <tr><td style="padding:28px;">
     <div style="font-size:14px;color:#444;margin-bottom:2px;font-weight:bold;">${trackName}</div>
     <div style="font-size:12px;color:#999;margin-bottom:18px;">Updated ${updated} &middot; averaged across ${sources} sources</div>
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#fbf6ea;border-radius:6px;margin-bottom:20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${colors.bg};border-radius:6px;margin-bottom:20px;border:1px solid ${colors.accent}22;">
       <tr><td align="center" style="padding:22px 10px;">
-        <div style="font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#a07d2a;margin-bottom:6px;">Density Altitude</div>
-        <div style="font-size:42px;font-weight:bold;color:#c47f00;line-height:1;">${da}<span style="font-size:15px;color:#a07d2a;"> FT</span></div>
+        <div style="font-size:11px;letter-spacing:1px;text-transform:uppercase;color:${colors.accent};margin-bottom:6px;">Density Altitude</div>
+        <div style="font-size:42px;font-weight:bold;color:${colors.accent};line-height:1;">${da}<span style="font-size:15px;"> FT</span></div>
       </td></tr>
     </table>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-      <tr>${row('Air Density Ratio', ratio)}<td width="2%"></td>${row('Correction Factor', cf)}</tr>
+      <tr>${row('Air Density Ratio', ratio, '#4f8fff')}<td width="2%"></td>${row('Correction Factor', cf, '#a86bff')}</tr>
       <tr><td colspan="3" style="height:8px;"></td></tr>
-      <tr>${row('Vapor Pressure', vapor)}<td></td>${row('Baro (station)', baro)}</tr>
+      <tr>${row('Vapor Pressure', vapor, '#2bb7a3')}<td></td>${row('Baro (station)', baro, '#ff8a4c')}</tr>
       <tr><td colspan="3" style="height:8px;"></td></tr>
-      <tr>${row('Temp / Dewpoint', `${temp} / ${dewpoint}`)}<td></td>${row('Humidity', humidity)}</tr>
+      <tr>${row('Temp / Dewpoint', `${temp} / ${dewpoint}`, '#ff5c7a')}<td></td>${row('Humidity', humidity, '#3ec6ff')}</tr>
       <tr><td colspan="3" style="height:8px;"></td></tr>
-      <tr><td colspan="3" style="padding:12px 14px;background:#f6f6f7;border-radius:5px;">
-        <div style="font-size:10px;letter-spacing:0.5px;text-transform:uppercase;color:#999;margin-bottom:4px;">Wind &middot; Pressure Altitude</div>
-        <div style="font-size:17px;font-weight:bold;color:#222;">${wind} &middot; ${pressureAlt}</div>
-      </td></tr>
+      <tr>${row('Wind', wind, '#6bcf6b')}<td></td>${row('Pressure Altitude', pressureAlt, '#e0b23c')}</tr>
     </table>
+    ${outlook ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px;"><tr><td style="padding:14px 16px;background:#eef5ff;border-left:3px solid #4f8fff;border-radius:4px;"><div style="font-size:10px;letter-spacing:0.5px;text-transform:uppercase;color:#4f77b3;margin-bottom:4px;">Next Hour Outlook</div><div style="font-size:13px;color:#333;">${outlook}</div></td></tr></table>` : ''}
     <div style="margin-top:22px;padding-top:16px;border-top:1px solid #eee;font-size:13px;color:#555;">${headline}</div>
   </td></tr>
   <tr><td style="padding:16px 28px;background:#fafafa;border-top:1px solid #eee;font-size:11px;color:#999;">
@@ -199,7 +262,7 @@ async function main() {
   const excluded = new Set(excludedSources || []);
 
   const jobs = [fetchNWS(lat, lon), ...OPEN_METEO_MODELS.map((m) => fetchOpenMeteoModel(lat, lon, m))];
-  const results = await Promise.all(jobs);
+  const [results, forecastRows] = await Promise.all([Promise.all(jobs), fetchForecast15(lat, lon)]);
   const ok = results.filter((r) => r.ok && !excluded.has(r.id));
   console.log(`Sources in average: ${ok.length}/${results.length} (${results.filter((r) => !r.ok).length} unavailable, ${excluded.size} manually excluded)`);
 
@@ -236,9 +299,11 @@ async function main() {
     baro: avgPressureHpa !== null ? `${hpa2inHg(avgPressureHpa).toFixed(2)}"` : '—',
     pressureAlt: pa !== null ? `${Math.round(pa).toLocaleString()} ft` : '—',
     temp: avgTempC !== null ? `${((avgTempC * 9) / 5 + 32).toFixed(0)}°F` : '—',
-    dewpoint: '—',
+    dewpoint: (() => { const d = dewpointC(avgTempC, avgRh); return d !== null ? `${((d * 9) / 5 + 32).toFixed(0)}°F` : '—'; })(),
     humidity: avgRh !== null ? `${avgRh.toFixed(0)}%` : '—',
     wind: avgWindKmh !== null ? `${kmh2mph(avgWindKmh).toFixed(0)} mph${avgWindDeg !== null ? ' @ ' + Math.round(avgWindDeg) + '°' : ''}` : '—',
+    daRaw: da,
+    outlook: buildOutlook(forecastRows) || null,
   };
 
   const state = await readJson(STATE_PATH, { lastAlertAt: null, lastUpdateAt: null });
